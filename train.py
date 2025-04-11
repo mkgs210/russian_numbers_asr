@@ -115,27 +115,37 @@ def collate_fn(batch):
 # ========================
 
 class ASRModel(nn.Module):
-    def __init__(self, n_mels=80, num_classes=11, rnn_hidden=128, num_rnn_layers=1, dropout_rate=0.1):
+    def __init__(self, n_mels=80, num_classes=11, rnn_hidden=128, num_rnn_layers=2, dropout_rate=0.3):
         """
-        n_mels: число мел-фильтров
-        num_classes: число классов (с blank)
-        rnn_hidden: размер скрытого состояния LSTM
-        num_rnn_layers: число слоёв LSTM
+        n_mels: число мел-фильтров.
+        num_classes: число классов (с blank).
+        rnn_hidden: размер скрытого состояния LSTM.
+        num_rnn_layers: число LSTM-слоёв (в данном случае 2).
+        dropout_rate: вероятность dropout для регуляризации.
         """
         super(ASRModel, self).__init__()
+        # Добавляем третий сверточный блок для более глубокого извлечения признаков
         self.conv = nn.Sequential(
+            # Блок 1
             nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=(2, 2)),
-
+            # Блок 2
             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=(2, 2)),
+            # Блок 3 (новый)
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=(2, 2))
         )
-        # Вычисление выходной размерности после свёрточной части (по частоте деление на 4)
-        conv_output_size = 64 * (n_mels // 4)
+        # Рассчитаем размерность по оси частот:
+        # Например, если n_mels = 80, то после трёх блоков с kernel_size=2 получаем приблизительное уменьшение:
+        # 80 -> 40 -> 20 -> 10 (округленно)
+        conv_output_size = 128 * (n_mels // 8)  # n_mels делим на 8, так как 2^3 = 8
         self.lstm = nn.LSTM(input_size=conv_output_size,
                             hidden_size=rnn_hidden,
                             num_layers=num_rnn_layers,
@@ -146,27 +156,28 @@ class ASRModel(nn.Module):
     def forward(self, x):
         """
         x: Tensor [batch, 1, n_mels, time]
-        Возвращает: log_probs [time, batch, num_classes] для CTC loss
+        Возвращает: log_probs [time, batch, num_classes] для CTC loss.
         """
         x = self.conv(x)  # [batch, channels, freq, time]
         batch_size, channels, freq, time = x.size()
         x = x.permute(3, 0, 1, 2)  # [time, batch, channels, freq]
         x = x.contiguous().view(time, batch_size, channels * freq)
         x, _ = self.lstm(x)
+        x = self.dropout(x)
         x = self.fc(x)
         log_probs = nn.functional.log_softmax(x, dim=2)
         return log_probs
 
 # ==========================================
-# 3. Обёртка в LightningModule (ASRLightning)
+# 3. LightningModule с регуляризацией и логированием lr
 # ==========================================
 
 class ASRLightningModule(pl.LightningModule):
-    def __init__(self, n_mels=80, num_classes=num_classes, rnn_hidden=128, 
-                num_rnn_layers=1, learning_rate=0.001, dropout_rate=0.1, weight_decay=1e-4):
+    def __init__(self, n_mels=80, num_classes=num_classes, rnn_hidden=128, num_rnn_layers=2,
+                 dropout_rate=0.3, learning_rate=0.001, weight_decay=1e-4):
         super(ASRLightningModule, self).__init__()
-        self.save_hyperparameters()  # сохраняем гиперпараметры
-        self.model = ASRModel(n_mels=n_mels, num_classes=num_classes,
+        self.save_hyperparameters()
+        self.model = ASRModel(n_mels=n_mels, num_classes=num_classes, 
                               rnn_hidden=rnn_hidden, num_rnn_layers=num_rnn_layers,
                               dropout_rate=dropout_rate)
         self.criterion = nn.CTCLoss(blank=0, zero_infinity=True)
@@ -177,24 +188,27 @@ class ASRLightningModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         specs, spec_lengths, targets, target_lengths = batch
-        # Прямой проход
-        output = self.model(specs)  # [time, batch, num_classes]
-        effective_spec_lengths = spec_lengths // 4  # корректировка из-за maxpool
+        output = self.model(specs)
+        # Корректировка длины: после трёх блоков maxpool масштабное уменьшение времени может отличаться,
+        # здесь мы предполагаем, что фактически размер по времени сокращается приблизительно в 8 раз,
+        # но если вы проводите расчет через dummy-тензор, уточните коэффициент.
+        effective_spec_lengths = spec_lengths // 8
         loss = self.criterion(output, targets, effective_spec_lengths, target_lengths)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        current_lr = self.trainer.optimizers[0].param_groups[0]["lr"]
+        self.log("lr", current_lr, prog_bar=True, logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         specs, spec_lengths, targets, target_lengths = batch
         output = self.model(specs)
-        effective_spec_lengths = spec_lengths // 4
+        effective_spec_lengths = spec_lengths // 8
         loss = self.criterion(output, targets, effective_spec_lengths, target_lengths)
         self.log("val_loss", loss, on_epoch=True, prog_bar=True, logger=True)
         return loss
 
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=self.learning_rate, weight_decay=self.hparams.weight_decay)
-        # Используем scheduler ReduceLROnPlateau
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2, verbose=True)
         return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "monitor": "val_loss"}}
 
@@ -221,7 +235,7 @@ def main():
     dev_loader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=8)
 
     # Инициализируем Lightning-модель
-    asr_module = ASRLightningModule(n_mels=80, num_classes=num_classes, rnn_hidden=256,
+    asr_module = ASRLightningModule(n_mels=80, num_classes=num_classes, rnn_hidden=128,
                                     num_rnn_layers=1, dropout_rate=0.1, learning_rate=learning_rate,
                                     weight_decay=1e-4)
 

@@ -7,3 +7,9 @@
 
 # VSCode
 .vscode
+
+# Data
+data
+
+# Experiments
+mlruns

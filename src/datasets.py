@@ -6,7 +6,12 @@ import torch
 import torchaudio
 from num2words import num2words
 from torch.utils.data import Dataset
-from torchaudio.transforms import AmplitudeToDB, MelSpectrogram, Resample
+from torchaudio.transforms import (
+    AmplitudeToDB,
+    MelSpectrogram,
+    Resample,
+    FrequencyMasking,
+)
 
 
 class NumericASRDataset(Dataset):
@@ -19,6 +24,13 @@ class NumericASRDataset(Dataset):
             sample_rate=target_sample_rate, n_fft=400, hop_length=160, n_mels=80
         )
         self.amplitude_to_db = AmplitudeToDB()
+        self.spec_augment = torch.nn.Sequential(
+            FrequencyMasking(freq_mask_param=25),
+            *[
+                torchaudio.transforms.TimeMasking(time_mask_param=15, p=0.05)
+                for _ in range(10)
+            ],
+        )
 
         self._vocab = "0123456789"
         self.vocab_to_idx = {ch: idx + 1 for idx, ch in enumerate(self._vocab)}
@@ -51,6 +63,10 @@ class NumericASRDataset(Dataset):
         if self.augment:
             waveform = waveform * random.uniform(0.8, 1.2)
         mel_spec = self.mel_transform(waveform)
+
+        for transform in self.spec_augment:
+            mel_spec = transform(mel_spec)
+
         mel_spec = self.amplitude_to_db(mel_spec)
         mel_spec = (mel_spec - mel_spec.mean()) / (mel_spec.std() + 1e-5)
 
@@ -74,6 +90,13 @@ class RussianWordsASRDataset(Dataset):
             sample_rate=target_sample_rate, n_fft=400, hop_length=160, n_mels=80
         )
         self.amplitude_to_db = AmplitudeToDB()
+        self.spec_augment = torch.nn.Sequential(
+            FrequencyMasking(freq_mask_param=25),
+            *[
+                torchaudio.transforms.TimeMasking(time_mask_param=15, p=0.05)
+                for _ in range(10)
+            ],
+        )
 
         self._vocab = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя -"
         self.vocab_to_idx = {ch: idx + 1 for idx, ch in enumerate(self._vocab)}
@@ -106,6 +129,10 @@ class RussianWordsASRDataset(Dataset):
         if self.augment:
             waveform = waveform * random.uniform(0.8, 1.2)
         mel_spec = self.mel_transform(waveform)
+
+        for transform in self.spec_augment:
+            mel_spec = transform(mel_spec)
+
         mel_spec = self.amplitude_to_db(mel_spec)
         mel_spec = (mel_spec - mel_spec.mean()) / (mel_spec.std() + 1e-5)
 

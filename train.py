@@ -57,7 +57,8 @@ def main():
         dropout=0.1,  # стандартное значение dropout
         learning_rate=0.0005,
         weight_decay=1e-4,
-        subsampling_factor=4,  # предполагаемая субдискретизация
+        subsampling_factor=4,  # предполагаемая субдискретизация,
+        idx_to_vocab=train_dataset.idx_to_vocab,
     )
 
     early_stop_callback = EarlyStopping(

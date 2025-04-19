@@ -3,8 +3,12 @@ import torch
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import MLFlowLogger
 from torch.utils.data import DataLoader
+from torchaudio.transforms import (
+    FrequencyMasking,
+    TimeMasking,
+)
 
-from src.datasets import RussianWordsASRDataset, collate_fn
+from src.datasets import CustomNumbersASRDataset, collate_fn
 from src.models import ASRLightningConformer
 
 torch.set_float32_matmul_precision("medium")
@@ -20,11 +24,16 @@ def main():
     num_epochs = 100
     early_stop_patience = 25
 
-    train_dataset = RussianWordsASRDataset(
-        train_csv, train_audio_dir, target_sample_rate=16000, augment=True
+    transforms = torch.nn.Sequential(
+        FrequencyMasking(freq_mask_param=25),
+        *[TimeMasking(time_mask_param=15, p=0.05) for _ in range(10)],
     )
-    dev_dataset = RussianWordsASRDataset(
-        dev_csv, dev_audio_dir, target_sample_rate=16000, augment=False
+
+    train_dataset = CustomNumbersASRDataset(
+        train_csv, train_audio_dir, target_sample_rate=16000, transforms=transforms
+    )
+    dev_dataset = CustomNumbersASRDataset(
+        dev_csv, dev_audio_dir, target_sample_rate=16000
     )
     train_loader = DataLoader(
         train_dataset,

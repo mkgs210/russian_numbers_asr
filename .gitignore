@@ -10,6 +10,15 @@
 
 # Data
 data
+dev
+train
 
 # Experiments
 mlruns
+checkpoints
+lightning_logs
+inference_output
+
+
+# results
+sample_submission.csv

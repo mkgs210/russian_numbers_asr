@@ -1,31 +1,55 @@
-import pytorch_lightning as pl
-import torch.nn as nn
-import torch.optim as optim
-from torchaudio.models import Conformer
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+import os
+import io
+import tempfile
 import torch
+import torch.nn as nn
+import pytorch_lightning as pl
+from torchaudio.models import Conformer
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torchmetrics.functional import char_error_rate
 import matplotlib.pyplot as plt
 from PIL import Image
-import io
+import mlflow
+
+from src.my_beam_search import tokens_to_number_string  # только утилита
 
 
 class ASRLightningConformer(pl.LightningModule):
     def __init__(
         self,
-        input_dim=80,
-        num_classes=31,
-        num_heads=4,
-        ffn_dim=576,
-        num_layers=3,
-        depthwise_conv_kernel_size=31,
-        dropout=0.1,
-        learning_rate=0.001,
-        weight_decay=1e-4,
-        subsampling_factor=4,
-        idx_to_vocab=None,
+        input_dim: int,
+        num_classes: int,
+        num_heads: int,
+        ffn_dim: int,
+        num_layers: int,
+        depthwise_conv_kernel_size: int,
+        dropout: float,
+        learning_rate: float,
+        weight_decay: float,
+        subsampling_factor: int,
+        scheduler_t_0: int,
+        scheduler_t_mult: int,
+        scheduler_min_lr: float,
+        cer_monitor: str,
+        optimizer_type: str,
+        augmentation_start_epoch: int,
+        idx_to_vocab: dict[int, str],
     ):
-        super(ASRLightningConformer, self).__init__()
+        super().__init__()
         self.save_hyperparameters()
-        self.idx_to_vocab = idx_to_vocab or {}
+
+        self.idx_to_vocab = idx_to_vocab
+        self.augment_from = augmentation_start_epoch
+        self.cer_monitor = cer_monitor
+        #self.val_sample_counter = 0
+
+        # Для логирования валид. спектрограмм
+        self.validation_samples = []
+
+        # Модель
         self.conformer = Conformer(
             input_dim=input_dim,
             num_heads=num_heads,
@@ -38,123 +62,156 @@ class ASRLightningConformer(pl.LightningModule):
         )
         self.fc = nn.Linear(input_dim, num_classes)
         self.criterion = nn.CTCLoss(blank=0, zero_infinity=True)
-        self.learning_rate = learning_rate
-        self.subsampling_factor = subsampling_factor
-
-        self.validation_samples = []
 
     def forward(self, x, lengths):
-        # Передаем lengths в Conformer и распаковываем выход
-        x, lengths_out = self.conformer(x, lengths)
+        x, out_lens = self.conformer(x, lengths)
         x = self.fc(x)
-        return x.transpose(0, 1)
+        return x.transpose(0, 1), out_lens
 
-    def decode_output(self, output):
-        pred_indices = torch.argmax(output, dim=1).tolist()
-        decoded = []
-        previous = None
-        for idx in pred_indices:
-            if idx != previous:
-                if idx != 0:  # Skip blank
-                    decoded.append(self.idx_to_vocab.get(idx, ""))
-                previous = idx
-        return "".join(decoded)
-
-    def decode_target(self, target_indices):
-        return "".join([self.idx_to_vocab.get(idx, "") for idx in target_indices])
+    def on_train_epoch_start(self):
+        # Включаем аугментацию только после нужной эпохи
+        dl = self.trainer.train_dataloader
+        ds = getattr(dl, "dataset", None) or dl[0].dataset
+        ds.augment = (self.current_epoch >= self.augment_from)
 
     def training_step(self, batch, batch_idx):
-        specs, spec_lengths, targets, target_lengths = batch
-        output = self.forward(specs, spec_lengths)
-        effective_spec_lengths = spec_lengths // self.subsampling_factor
-        loss = self.criterion(output, targets, effective_spec_lengths, target_lengths)
-        self.log(
-            "train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True
-        )
-        current_lr = self.trainer.optimizers[0].param_groups[0]["lr"]
-        self.log("lr", current_lr, prog_bar=True, logger=True)
+        specs, lens, targets, t_lens = batch
+        logits, out_lens = self(specs, lens)
+
+        eff = out_lens // self.hparams.subsampling_factor
+        eff = torch.clamp(eff, min=1)
+        loss = self.criterion(logits, targets, eff, t_lens)
+        self.log("train_loss", loss, prog_bar=True, batch_size=specs.size(0))
         return loss
 
     def validation_step(self, batch, batch_idx):
-        specs, spec_lengths, targets_concat, target_lengths = batch
-        output = self.forward(specs, spec_lengths)
-        effective_spec_lengths = spec_lengths // self.subsampling_factor
-        loss = self.criterion(
-            output, targets_concat, effective_spec_lengths, target_lengths
-        )
-        self.log("val_loss", loss, on_epoch=True, prog_bar=True, logger=True)
+        specs, lens, targets, t_lens = batch
+        logits, out_lens = self(specs, lens)
 
-        if batch_idx == 0:  # Log samples from the first validation batch
-            batch_size = specs.size(0)
-            n_samples = min(batch_size, 5)  # Log up to 5 samples
-            for i in range(n_samples):
-                # Process each sample
-                spec_len = spec_lengths[i].item()
-                mel_spec = specs[i, :spec_len, :].cpu().numpy().T  # (n_mels, time)
+        eff = out_lens // self.hparams.subsampling_factor
+        eff = torch.clamp(eff, min=1)
+        loss = self.criterion(logits, targets, eff, t_lens)
+        self.log("val_loss", loss, prog_bar=True, batch_size=specs.size(0))
 
-                effective_len = effective_spec_lengths[i].item()
-                sample_output = output[:effective_len, i, :].cpu()
+        # Greedy decode для CER (каждый 10-й пример)
+        bs = specs.size(0)
+        offset = 0
+        for i in range(bs):
+            L = t_lens[i].item()
+            ref_idx = targets[offset : offset + L].cpu().tolist()
+            offset += L
 
-                predicted_text = self.decode_output(sample_output)
+            # self.val_sample_counter += 1
+            # if self.val_sample_counter % 10 != 0:
+            #     continue
 
-                # Extract target indices
-                target_start = sum(target_lengths[:i])
-                target_end = target_start + target_lengths[i]
-                target_indices = targets_concat[target_start:target_end].cpu().tolist()
-                ground_truth_text = self.decode_target(target_indices)
+            probs = torch.softmax(logits[:, i, :], dim=-1)
+            pred = torch.argmax(probs, dim=-1).tolist()
+            toks, prev = [], 0
+            for idx in pred:
+                if idx != prev and idx != 0:
+                    toks.append(self.idx_to_vocab[idx])
+                prev = idx
 
-                self.validation_samples.append(
-                    {
-                        "mel_spec": mel_spec,
-                        "predicted_text": predicted_text,
-                        "ground_truth_text": ground_truth_text,
-                    }
-                )
+            # Если первый токен '|', вставляем '<1>'
+            if toks and toks[0] == "|":
+                toks = ["<1>", "|"] + toks[1:]
+
+            pred_str_tok = "".join(toks)
+            pred_str_num = tokens_to_number_string(toks)
+
+            ref_toks    = [self.idx_to_vocab[x] for x in ref_idx]
+            ref_str_tok = "".join(ref_toks)
+            ref_str_num = tokens_to_number_string(ref_toks)
+
+            cer_t = char_error_rate([pred_str_tok], [ref_str_tok]).item()
+            cer_n = char_error_rate([pred_str_num], [ref_str_num]).item()
+            self.log("CER_tokens_step", cer_t, batch_size=1)
+            self.log("CER_numeric_step", cer_n, batch_size=1)
+
+            # Собираем примеры для логирования спектрограмм (первые 3 примера)
+            if batch_idx == 0 and len(self.validation_samples) < 3:
+                # Спектрограмма: [n_mels, time]
+                mel = specs[i, :lens[i].item(), :].cpu().numpy().T
+                self.validation_samples.append({
+                    "mel_spec": mel,
+                    "pred_tok": pred_str_tok,
+                    "ref_tok":  ref_str_tok,
+                    "pred_num": pred_str_num,
+                    "ref_num":  ref_str_num,
+                })
+
         return loss
 
     def on_validation_epoch_end(self):
-        if not self.validation_samples or not self.logger:
+        # если нет ни одного примера — сразу выходим
+        if not self.validation_samples:
             return
 
-        def _plt_image_to_pillow_image(plt_image) -> Image:
-            img_buf = io.BytesIO()
-            plt_image.savefig(img_buf, format="png")
-            pillow_image = Image.open(img_buf)
-            return pillow_image
-
-        for i, sample in enumerate(self.validation_samples[:5]):
-            fig, ax = plt.subplots(figsize=(10, 4))
-            im = ax.imshow(
-                sample["mel_spec"], aspect="auto", origin="lower", cmap="viridis"
-            )
-            plt.colorbar(im, ax=ax)
+        for idx, s in enumerate(self.validation_samples):
+            # 1) Рисуем спектрограмму
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.imshow(s["mel_spec"], aspect="auto", origin="lower", cmap="viridis")
             ax.set_title(
-                f"Pred: {sample['predicted_text']}\nTrue: {sample['ground_truth_text']}"
+                f"Pred TOK: {s['pred_tok']}\n"
+                f"Ref  TOK: {s['ref_tok']}\n"
+                f"Pred NUM: {s['pred_num']}\n"
+                f"Ref  NUM: {s['ref_num']}"
             )
             plt.tight_layout()
 
-            image = _plt_image_to_pillow_image(fig)
+            # 2) Сохраняем во временный файл
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                fig.savefig(tmp.name, format="png")
+                tmp_path = tmp.name
+            plt.close(fig)
 
-            epoch = self.trainer.current_epoch
-
-            self.logger.experiment.log_image(
-                run_id=self.logger.run_id,
-                image=image,
-                artifact_file=f"val_samples/epoch_{epoch}/epoch_{epoch}_sample_{i}.png",
+            # 3) Логируем через MlflowClient, доступный в self.logger.experiment
+            #    Первым аргументом — run_id, вторым — локальный путь файла, третьим — папка внутри артефактов.
+            self.logger.experiment.log_artifact(
+                self.logger.run_id,
+                local_path=tmp_path,
+                artifact_path=f"val_spectrograms/epoch_{self.current_epoch}"
             )
 
-        self.validation_samples = []
+            # 4) Удаляем временный файл
+            os.remove(tmp_path)
+
+        # 5) Очищаем накопленные примеры, чтобы не залогировать дважды
+        self.validation_samples.clear()
 
     def configure_optimizers(self):
-        optimizer = optim.Adam(
-            self.parameters(),
-            lr=self.learning_rate,
-            weight_decay=self.hparams.weight_decay,
-        )
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=10, verbose=True
+        lr  = self.hparams.learning_rate
+        wd  = self.hparams.weight_decay
+        opt = self.hparams.optimizer_type
+
+        if opt == "AdamW":
+            from torch.optim import AdamW
+            optimizer = AdamW(self.parameters(), lr=lr, weight_decay=wd)
+        elif opt == "NovoGrad":
+            from torch_optimizer import NovoGrad
+            optimizer = NovoGrad(self.parameters(), lr=lr, weight_decay=wd)
+        elif opt == "Lion":
+            from lion_pytorch import Lion
+            optimizer = Lion(self.parameters(), lr=lr, weight_decay=wd)
+        elif opt == "Ranger":
+            from torch_optimizer import Ranger
+            optimizer = Ranger(self.parameters(), lr=lr, weight_decay=wd)
+        else:
+            raise ValueError(f"Unknown optimizer: {opt}")
+
+        scheduler = CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=self.hparams.scheduler_t_0,
+            T_mult=self.hparams.scheduler_t_mult,
+            eta_min=self.hparams.scheduler_min_lr,
         )
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "monitor": "val_loss"},
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": self.hparams.cer_monitor,
+                "interval": "epoch",
+                "frequency": 1,
+            },
         }

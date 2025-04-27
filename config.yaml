@@ -1,0 +1,74 @@
+# =========================
+# Пути к данным
+# =========================
+data:
+  train_csv:       "./data/train.csv"
+  dev_csv:         "./data/dev.csv"
+  train_audio_dir: "./data"
+  dev_audio_dir:   "./data"
+
+# =========================
+# Параметры модели
+# =========================
+model:
+  input_dim:             80      # число мел-банов
+  num_classes:           31      # автоматически беру из train_ds.num_classes
+  num_heads:             8       # увеличил для большего внимания
+  ffn_dim:               1024    # расширил FFN для лучшей выразительности
+  num_layers:            6       # глубина Conformer
+  kernel_size:           31      # размер depthwiseConv
+  dropout:               0.1     # легкий dropout
+  subsampling_factor:    4       # понижаем до ×4 для лучшего выравнивания
+
+# =========================
+# Оптимизация и LR
+# =========================
+optimizer:
+  type:           "AdamW"    # AdamW–decoupled weight decay
+  lr:             0.001      # начальный LR
+  weight_decay:   1e-4       # весовой decay
+  warmup_epochs:  5          # LR будет «разогреваться» первые 5 эпох
+
+scheduler:
+  type:       "CosineAnnealingWarmRestarts"  # перезапуски косинусного спада
+  t_0:        10                             # период первого цикла
+  t_mult:     1                              # множитель периода
+  eta_min:    0.000005                       # минимальный LR после спада
+
+# =========================
+# Аугментации
+# =========================
+augmentation:
+  noise_std:     0.05       # σ шума
+  start_epoch:   3          # включать все аугментации с 3-й эпохи
+  # SpecAugment настройки
+  specaug:
+    # «мягкая» версия
+    normal:
+      freq_mask_param: 30
+      time_mask_param: 70
+    # «агрессивная» версия
+    aggressive:
+      freq_mask_param: 25
+      time_mask_param: 15
+      time_mask_count: 10    # число отдельных TimeMasking блоков
+      time_mask_prob: 0.05
+  # Дополнительные аугментации (рекомендуется)
+  speed_perturb: [0.9, 1.1]  # изменяем скорость ±10%
+
+# =========================
+# Декодирование (после обучения)
+# =========================
+decoding:
+  beam_width: 5             # ширина луча для beam-search
+  apply_fsa:  true          # применять FSA-ограничения на структуру числа
+
+# =========================
+# Тренировка
+# =========================
+training:
+  batch_size:           8
+  max_epochs:           200
+  es_patience:          65
+  es_monitor:           "CER_numeric_step"       # или "CER_numeric_avg" "val_loss"
+  log_every_n_steps:    10

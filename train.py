@@ -110,53 +110,78 @@ def main():
     # 10) Обучение
     trainer.fit(model, train_loader, dev_loader, ckpt_path=ckpt_path)
 
-    # 11) Финальный beam-search с прогресс-баром
-    print("\n=== Final beam-search evaluation on DEV set ===")
+    # 11) Финальный greedy+beam evaluation на DEV set
+    print("\n=== Final greedy+beam evaluation on DEV set ===")
     best_ckpt = checkpoint.best_model_path
     model = ASRLightningConformer.load_from_checkpoint(best_ckpt)
     model.eval().to(trainer.strategy.root_device)
 
-    total_chars = total_err_tok = total_err_num = 0
+    total_chars      = 0
+    total_err_tok_g  = 0.0
+    total_err_num_g  = 0.0
+    total_err_tok_b  = 0.0
+    total_err_num_b  = 0.0
 
     with torch.no_grad():
-        for specs, lens, targets, t_lens in tqdm(dev_loader, desc="Beam eval"):
+        for specs, lens, targets, t_lens in tqdm(dev_loader, desc="Final eval"):
             specs = specs.to(model.device)
             lens  = lens.to(model.device)
 
             logits, out_lens = model(specs, lens)
+            # Для simplicity: batch_size=1 на валидации
             logp = torch.log_softmax(logits[:,0,:], dim=-1).cpu()
 
+            # — greedy decode —
+            greedy_ids = logp.argmax(dim=-1).tolist()
+            toks_g, prev = [], 0
+            for idx in greedy_ids:
+                if idx != prev and idx != 0:
+                    toks_g.append(model.idx_to_vocab[idx])
+                prev = idx
+            if toks_g and toks_g[0] == "|":
+                toks_g = ["<1>","|"] + toks_g[1:]
+            p_tok_g = "".join(toks_g)
+            p_num_g = tokens_to_number_string(toks_g)
+
+            # — beam-search decode —
             beams = ctc_beam_search_fsa(
                 logp,
                 beam_width=cfg["decoding"]["beam_width"],
                 blank=0
             )
-            seq, _ = beams[0]
-            toks = [model.idx_to_vocab[i] for i in seq]
+            seq_b, _ = beams[0]
+            toks_b = [model.idx_to_vocab[i] for i in seq_b]
+            if toks_b and toks_b[0] == "|":
+                toks_b = ["<1>","|"] + toks_b[1:]
+            p_tok_b = "".join(toks_b)
+            p_num_b = tokens_to_number_string(toks_b)
 
-            # если первый токен '|' → вставляем '<1>'
-            if toks and toks[0] == "|":
-                toks = ["<1>","|"] + toks[1:]
-
-            p_tok = "".join(toks)
-            p_num = tokens_to_number_string(toks)
-
+            # reference
             L = t_lens.item()
             ref_idx = targets[:L].cpu().tolist()
-            r_toks  = [model.idx_to_vocab[i] for i in ref_idx]
-            r_tok   = "".join(r_toks)
-            r_num   = tokens_to_number_string(r_toks)
+            r_toks   = [model.idx_to_vocab[i] for i in ref_idx]
+            r_tok    = "".join(r_toks)
+            r_num    = tokens_to_number_string(r_toks)
 
-            ce_t = char_error_rate([p_tok],[r_tok]).item()
-            ce_n = char_error_rate([p_num],[r_num]).item()
+            # CER greedy
+            ce_t_g = char_error_rate([p_tok_g], [r_tok]).item()
+            ce_n_g = char_error_rate([p_num_g], [r_num]).item()
+            total_err_tok_g += ce_t_g * len(r_tok)
+            total_err_num_g += ce_n_g * len(r_tok)
 
-            total_err_tok += ce_t * len(r_tok)
-            total_err_num += ce_n * len(r_tok)
-            total_chars    += len(r_tok)
+            # CER beam
+            ce_t_b = char_error_rate([p_tok_b], [r_tok]).item()
+            ce_n_b = char_error_rate([p_num_b], [r_num]).item()
+            total_err_tok_b += ce_t_b * len(r_tok)
+            total_err_num_b += ce_n_b * len(r_tok)
 
-    print(f"FINAL CER tokens:  {total_err_tok/total_chars:.4f}")
-    print(f"FINAL CER numeric: {total_err_num/total_chars:.4f}")
+            total_chars += len(r_tok)
 
+    # Печатаем два набора метрик
+    print(f"FINAL Greedy CER tokens:  {total_err_tok_g/total_chars:.4f}")
+    print(f"FINAL Greedy CER numeric: {total_err_num_g/total_chars:.4f}")
+    print(f" FINAL Beam CER tokens:  {total_err_tok_b/total_chars:.4f}")
+    print(f" FINAL Beam CER numeric: {total_err_num_b/total_chars:.4f}")
 
 if __name__ == "__main__":
     main()

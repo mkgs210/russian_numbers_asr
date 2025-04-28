@@ -13,7 +13,8 @@ from src.my_beam_search import tokens_to_number_string
 from src.models import ASRLightningConformer
 
 # ─────────── SETTINGS ───────────
-CHECKPOINT_PATH = "./mlruns/156786290563127125/72c47862908346c8a8dbcde91ea3bebf/checkpoints/epoch=29-step=47100.ckpt"   # путь к лучшему чекпоинту
+#CHECKPOINT_PATH = "./mlruns/156786290563127125/72c47862908346c8a8dbcde91ea3bebf/checkpoints/epoch=29-step=47100.ckpt"   # 21.746
+CHECKPOINT_PATH = './mlruns/156786290563127125/d2137feeef3949b7b82bf092866cfe01/checkpoints/epoch=56-step=89490.ckpt'
 TEST_CSV        = "./data/test.csv"          # CSV со столбцом "filename"
 AUDIO_DIR       = "./data"                   # папка, где лежит test/…
 OUTPUT_CSV      = "sample_submission.csv"
